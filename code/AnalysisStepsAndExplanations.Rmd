@@ -1,0 +1,422 @@
+---
+title: "Ghana Agricultural Profits Analysis Steps and Explanations"
+author: Group 07 - Siqi Zhang, Huibo Jia, Qiyu Ye, Mark Russeff
+date: 12-06-2018
+output: html_notebook
+---
+
+```{r echo = FALSE, warning = FALSE}
+library(tidyverse)
+library(haven)
+library(car)
+library(here)
+
+setwd(here())
+
+source(here("code","helperFunc.R"))
+```
+
+## Read data
+
+After reading through the documentation, we determined these data files contain the data we want to use to analyze the influencing factors of Ghana agricultural profits
+
+```{r}
+# list of data file pairs to read, first is subfolder, second is file name
+datafiles <- list(c("aggregates/", "agg2"),
+                  c("", "sec8b"),
+                  c("", "sec0a"),
+                  c("", "sec1"),
+                  c("", "sec2a"),
+                  c("", "sec8a2"),
+                  c("", "sec8a3"),
+                  c("", "sec8c1"),
+                  c("", "sec8c2"),
+                  c("community/", "cs2"))
+
+invisible(sapply(datafiles, readRawData))
+```
+
+## Calculate agricultural profit per area unit
+
+First we need to convert different area unit into a same one. Looking at count of each unit, acre is the major one, so we decide to map other units to acre. According to G4USERSG.pdf, we create a map between each unit to a multiplier of it when it's converted to acre (the "Other" unit is treated as NA). Then join the map onto `sec8b` and multiply with original land size to get unified land size (values greater than 1e+100 are treated as NA). We noticed that some households have multiple entries of land size info and among them there is NA value. So we convert NA to 0 so we can sum up land size for each household. Eventually, household with land size less than 0.5 acre are filtered out because that's probably not a real farm.
+
+Area unit | To Acre
+----------|------------
+1 Acre    | 1 Acre
+1 Poles   | 1 Acre
+1 Ropes   | 1/9 Acre
+Other     | NA
+
+```{r}
+# map land size units to acre with a multiplier (s8bq4bm)
+# the "Other" unit is treated as NA
+table(sec8b$s8bq4b)
+land_size_unit_map <- data.frame("s8bq4b" = as.double(c(1:4)),
+                                 "s8bq4bm" = c(1, 1, 1/9, NA))
+
+# convert all land size to acre
+land_size_info <- sec8b %>%
+  select(clust, nh, s8bq4a, s8bq4b) %>%
+  mutate(s8bq4a = ifelse(s8bq4a > 1e+100, NA, s8bq4a),
+         s8bq4b = ifelse(s8bq4b > 1e+100, NA, s8bq4b)) %>%
+  left_join(land_size_unit_map) %>%
+  # s8bq4ac is corrected s8bq4a, which is land size in acre
+  mutate(s8bq4ac = s8bq4a * s8bq4bm) %>%
+  # convert NA to 0 to calculate sum of land size for each household
+  replace(., is.na(.), 0) %>%
+  group_by(clust, nh) %>%
+  summarise(landSize = sum(s8bq4ac)) %>%
+  # remove household with small land size
+  filter(landSize >= 0.5)
+```
+
+Then we use agricultural income minus depreciation of farm equipment (`agri1 - hhagdepn`) as household profit, and devide it by household land size to get profit per area unit. `agg2` does not have NA value so no need to clean up.
+
+```{r}
+# identify count of NAs in agg2
+colSums(is.na(agg2))
+
+# check correlation between agricultural income and corrected agricultural income
+cor(agg2$agri1, agg2$agri1c)
+
+# resolve warnings during join
+attr(agg2$clust, "label") <- "Enumeration Area number"
+attr(agg2$nh, "label") <- "Household ID"
+
+# calculate household agri profit per acre
+# because the above correlations are both 1,
+# use only "agri1" to calculate agricultural profit
+hh_profit_info <- agg2 %>%
+  select(clust, nh, agri1, hhagdepn) %>%
+  filter(agri1 != 0) %>%
+  inner_join(land_size_info, by = c("clust", "nh")) %>%
+  mutate(profit = (agri1 - hhagdepn) / landSize) %>%
+  select(-agri1, -hhagdepn, -landSize)
+
+attr(hh_profit_info$profit, "label") <- "HH agri profit"
+```
+
+## Tidy household basic information
+
+For basic household information, we are interested in language of respondent (values greater than 1e+100 are treated as "Unknown" language), ecological zone number and 3 different locality classifications. All variables are converted to factor type so they could be used as dummy variables in linear model.
+
+```{r}
+# household basic information
+hh_basic_info <- sec0a %>%
+  select(region, district, eanum, clust, nh, reslan, ez:loc3) %>%
+  mutate(reslan = cleanAndFactorize(reslan, 1e+100, 99,
+                                    levels = as.character(c(1:8, 99)),
+                                    labels = c("English", "Akan", "Ewe", "GaAdangbe",
+                                               "Dagbani", "Hausa", "Nzema", "Other", "Unknown")),
+         ez = factor(ez,
+                     levels = as.character(c(1:3)),
+                     labels = c("Coastal", "Forest", "Savannah")),
+         loc2 = factor(loc2,
+                       levels = as.character(c(1,2)),
+                       labels = c("Urban", "Rural")),
+         loc5 = factor(loc5, 
+                       levels = as.character(c(1:5)),
+                       labels = c("Accra", "OtherUrban", "RuralCoastal",
+                                  "RuralForest", "RuralSavannah")),
+         loc3 = factor(loc3,
+                       levels = as.character(c(1:3)),
+                       labels = c("Accra", "OtherUrban", "Rural"))
+  )
+```
+
+## Tidy household member information
+
+We picked some data about household members such as sex, age and education and aggregate them on household level to analyze the effect of variety of household members on agricultural profit.
+
+Select household members sex and age information and calculate mean, max and min age of household. The relation (`rel`) data is used to filter by head of household later.
+
+```{r}
+# household member information
+hhm_info <- sec1 %>%
+  select(clust, nh, pid, sex, agey, rel) %>%
+  group_by(clust, nh) %>%
+  mutate(female = sex == 2,
+         age = agey,
+         avgAge = mean(agey),
+         maxAge = max(agey),
+         minAge = min(agey)
+  ) %>%
+  select(-sex, -agey)
+```
+
+For education data, we categorize educational qualification (`s2aq3`) into 5 levels: "None", "BasicEducation", "SecondaryEducation", "TertiaryEducation" and "Other", based on information from the two sources below. For missing value in `s2aq3`, it's because these people never attended school (`s2aq1 == 2`). In this case we set education to None.
+
+[Education System in Ghana](https://www.scholaro.com/pro/Countries/Ghana/Education-System)
+
+[Education in Ghana Wikipedia](https://en.wikipedia.org/wiki/Education_in_Ghana)
+
+Educational Qualification | Education Level
+--------------------------|--------------------
+01 None                   | None
+02 MSLC?BECE              | BasicEducation
+03 Voc/Comm               | SecondaryEducation
+04 ‘O’ Level              | SecondaryEducation
+05 SSS                    | SecondaryEducation
+06 ‘A’ Level              | SecondaryEducation
+07 T/T Cert. B            | TertiaryEducation
+08 T /T Cert. A           | TertiaryEducation
+09 Nursing                | TertiaryEducation
+10 Tech/Prof Cert.        | TertiaryEducation
+11 Tech/Prof Dip          | TertiaryEducation
+12 Bachelor               | TertiaryEducation
+13 Masters                | TertiaryEducation
+14 Doctorate              | TertiaryEducation
+96 Other                  | Other
+
+```{r warning = FALSE}
+# household member education information
+# map education qualification to education level
+educ_level_map <- data.frame("s2aq3" = c(1:14, 96),
+                             "s2aq3l" = c(1, 2, rep(3, 4), rep(4, 8), 5))
+
+# resolve warnings
+attr(educ_level_map$s2aq3, "label") <- "Highest educ qualification"
+attr(educ_level_map$s2aq3, "format.stata") <- "%10.0g"
+
+# Check NAs
+colSums(is.na(sec2a))
+
+hhm_educ <- sec2a %>%
+  select(clust, nh, pid, s2aq1, s2aq3) %>%
+  # if never attended school (s2aq1 == 2), set education to None (s2aq3 = 1)
+  mutate(s2aq3 = ifelse(s2aq1 == 2, 1, s2aq3)) %>%
+  left_join(educ_level_map) %>%
+  mutate(educ = factor(s2aq3l,
+                       levels = as.character(c(1:5)),
+                       labels = c("None", "BasicEducation", "SecondaryEducation",
+                                  "TertiaryEducation", "Other"))) %>%
+  select(-s2aq1, -s2aq3, -s2aq3l)
+```
+
+Then we join household member info and education info, and use data from head of household (`rel == 1`) as a representative of the household.
+
+```{r}
+hh_head_info <- hhm_info %>%
+  inner_join(hhm_educ, by=c("clust", "nh", "pid")) %>%
+  filter(rel == 1) %>% # head of household
+  select(-pid, -rel)
+```
+
+## Tidy agricultural characteristics information
+
+We included agricultural characteristics information in our analysis as well, includign Livestock and Fishing (`sec8a2`), Agricultural equipment (`sec8a3`) and Crops (`sec8c1` and `sec8c2`). We would like to see if any certain types of livestock, equipment and/or crop would contribute a lot to profit.
+
+For livestock data, we found that there are too many missing values (value greater than 1e+100) in its unit of messaure (`s8aq22b`). So we decided to spread livestock count by livestock type so that each livestock type is a column with the count as its value, and assume same livestock type has same unit of messaure so we can compare accros them. We also created a column for the count of different livestock types each household owns.
+
+```{r}
+table(sec8a2$s8aq22b)
+# spread livestock count and count livestock type
+# since there are too many missing value in livestock unit of messaure (s8aq22b),
+# we assume same livestock type has same unit,
+# and we only take livestock count (s8aq22a) into consideration
+hh_livestock_info <- sec8a2 %>%
+  select(clust, nh, livstcd, s8aq22a) %>%
+  group_by(clust, nh) %>%
+  mutate(livstcdTypeCount = n()) %>%
+  spread(key = livstcd,
+         value = s8aq22a,
+         fill = 0,
+         sep = "")
+summary(hh_livestock_info)
+```
+
+Similarly we process the agricultural equipment data.
+
+```{r}
+# spread agricultural equipment count and count agricultural equipment type
+hh_equip_info <- sec8a3 %>%
+  select(clust, nh, eqcdown, s8aq34) %>%
+  replace(., . > 1e+100, 0) %>%
+  filter(s8aq34 != 0) %>%
+  group_by(clust, nh) %>%
+  mutate(equipTypeCount = n()) %>%
+  spread(key = eqcdown,
+         value = s8aq34,
+         fill = 0,
+         sep = "")
+summary(hh_equip_info)
+```
+
+For crop data, we noticed that some households have multiple entries of same crop type. So we need to group by household and crop type and sum up across same crop type.
+
+```{r}
+# spread household havested crop count and count havested crop type
+# some households have multiple entries of same crop type, for example:
+(sec8c1 %>% select(clust, nh, cropcd, s8cq3a))[c(377, 378),]
+# so need to sum up quantity of same crop type
+hh_crop_info <- sec8c1 %>%
+  select(clust, nh, cropcd, s8cq3a) %>%
+  replace(., . > 1e+100, 0) %>%
+  group_by(clust, nh, cropcd) %>%
+  # sum up quantity of same crop type
+  summarise(s8cq3ac = sum(s8cq3a)) %>% 
+  group_by(clust, nh) %>%
+  mutate(cropTypeCount = n()) %>%
+  spread(key = cropcd,
+         value = s8cq3ac,
+         fill = 0,
+         sep = "")
+summary(hh_crop_info)
+
+# spread household havested root count and count havested root type
+hh_root_info <- sec8c2 %>%
+  select(clust, nh, rootcd, s8cq21a) %>%
+  replace(., . > 1e+100, 0) %>%
+  group_by(clust, nh, rootcd) %>%
+  # sum up quantity of same root type
+  summarise(s8cq21ac = sum(s8cq21a)) %>% 
+  group_by(clust, nh) %>%
+  mutate(rootTypeCount = n()) %>%
+  spread(key = rootcd,
+         value = s8cq21ac,
+         fill = 0,
+         sep = "")
+summary(hh_root_info)
+```
+
+Do a full join to combine all 4 trunk of data together. Since not every household have entries in all 4 type of agricultural characteristics, we assume the missing value simply means they just don't have that type and replace it with 0.
+
+```{r}
+hh_agri_info <- hh_livestock_info %>%
+  full_join(hh_equip_info, by=c("clust", "nh")) %>%
+  full_join(hh_crop_info, by=c("clust", "nh")) %>%
+  full_join(hh_root_info, by=c("clust", "nh")) %>%
+  replace(., is.na(.), 0)
+```
+
+## Tidy community information
+
+We chose market and transport information from the community data and convert them to logical value.
+
+```{r}
+hh_comm_info <- cs2 %>%
+  select(region, district, eanum, s2q19, s2q23) %>%
+  mutate(market = ifelse(s2q19 == 1, TRUE, FALSE),
+         transport = ifelse(s2q23 == 1, TRUE, FALSE)) %>%
+  select(-s2q19, -s2q23)
+```
+
+## Combine all information
+
+Combine household basic info, household member info (using head as representitive), community info and household agricultural characteristics info together by inner join, because if a household does not have all 4 info, we don't want to use its data in our model fitting. From the combined data, we also created two subset for rural and urban areas. We are interested to see if the two ares have different influencing factors on profit.
+
+```{r warning = FALSE}
+hh_all_info <- hh_basic_info %>%
+  inner_join(hh_head_info, by=c("clust", "nh")) %>%
+  inner_join(hh_comm_info, by=c("region", "district", "eanum")) %>%
+  inner_join(hh_agri_info, by=c("clust", "nh"))
+
+hh_profit <- hh_profit_info %>%
+  inner_join(hh_all_info, by=c("clust", "nh")) %>%
+  select(-region, -district, -eanum, -clust, -nh)
+
+# filter out rural and urban data from hh_profit
+hh_profit_rural <- hh_profit %>%
+  filter(loc2 == "Rural")
+# remove factor type column with only one value
+hh_profit_rural <- Filter(function(x) !isSingleValueFactorColumn(x), hh_profit_rural)
+
+hh_profit_urban <- hh_profit %>%
+  filter(loc2 == "Urban")
+# remove factor type column with only one value
+hh_profit_urban <- Filter(function(x) !isSingleValueFactorColumn(x), hh_profit_urban)
+```
+
+## Fit model and regression diagnostics
+
+Now we fit linear regression models with different variables and do regression diagnostics.
+
+#### Unrestricted model
+
+First we fit an unrestricted model. Looking at its summary, there are some significant variables. Looking at null hypothesis test result, there are correlated variables in this model. So we should fit a restriced model. Following the model summary is the histogram of standardized residuals and plot of residuals vs fitted values.
+
+```{r}
+hh_profit_model_ur <- lm(profit ~ .,
+                         data = hh_profit)
+checkCorrVarAndTestHnull(hh_profit_model_ur)
+suppressWarnings(plotResiduals(hh_profit, hh_profit_model_ur, "lightblue", "UR"))
+```
+
+#### Restricted model with significant variables (R1)
+
+We pick the significant variables from the above unrestricted model and fit a restricted model.
+
+```{r}
+hh_profit_model_r1 <- lm(profit ~ reslan + ez + age + market + livstcd5 + livstcd6 + livstcd7 + livstcd10 +
+                           equipTypeCount + eqcdown61 + cropcd5 + cropcd8 + cropcd11 + cropcd25 + cropcd29 +
+                           rootcd7 + rootcd18 + rootcd20 + rootcd27 + rootcd33 + rootcd36,
+                         data = hh_profit)
+checkCorrVarAndTestHnull(hh_profit_model_r1)
+suppressWarnings(plotResiduals(hh_profit, hh_profit_model_r1, "darkblue", "R1"))
+```
+
+#### Restricted model with top features from agricultural characteristics information (TOP)
+
+We are also interested to see how will the model perform if fitted only with top 15 features from agricultural characteristics information. These top features are the variables that have higher correlation with profit, no matter it's positive or negative correlation.
+
+```{r}
+hh_profit_agri <- hh_profit[, -c(2:14)] # get agricultural characteristics variables
+all_correlations <- findAbsoluteCorrelation(hh_profit_agri)
+hh_profit_agri_topFeatures <- hh_profit[c("profit", all_correlations$colName[1:15])]
+hh_profit_model_topfeatures <- lm(profit ~ . , data = hh_profit_agri_topFeatures)
+checkCorrVarAndTestHnull(hh_profit_model_topfeatures)
+suppressWarnings(plotResiduals(hh_profit, hh_profit_model_topfeatures, "purple", "TOP"))
+```
+
+#### Unrestricted model for rural area (RURAL)
+
+Fit unrestricted model for rural area profit.
+
+```{r}
+hh_profit_model_rural <- lm(profit ~ .,
+                            data = hh_profit_rural)
+checkCorrVarAndTestHnull(hh_profit_model_rural)
+suppressWarnings(plotResiduals(hh_profit_rural, hh_profit_model_rural, "green", "RURAL"))
+```
+
+#### Unrestricted model for urban area
+
+Fit unrestricted model for urban area profit. We notice that the adjusted R squared is really low, and there are a lot of correlated variable. By looking at data size, we see that there are less observations than variables for urban are profit data. So we don't have enough data to fit a model.
+
+```{r}
+hh_profit_model_urban <- lm(profit ~ .,
+                            data = hh_profit_urban)
+checkCorrVarAndTestHnull(hh_profit_model_urban)
+# check data size
+dim(hh_profit_urban)
+```
+
+#### Restricted model with only education and local characteristic information (R2, R3)
+
+We also want to see how education and local characteristic info alone influence profit. Looking at hypothesis test result, loc5 and loc3 are correlated with other variables. So remove them and fit model again. Looking at the summary, there are not many significant variables, also the R squared is very low.
+
+```{r}
+hh_profit_model_r2 <- lm(profit ~ educ + ez + loc2 + loc5 + loc3 + market + transport, 
+                         data = hh_profit)
+checkCorrVarAndTestHnull(hh_profit_model_r2)
+suppressWarnings(plotResiduals(hh_profit, hh_profit_model_r2, "yellow", "R2"))
+```
+
+```{r}
+# remove loc5 and loc3 and fit model again
+hh_profit_model_r3 <- lm(profit ~ educ + ez + loc2 + market + transport, 
+                         data = hh_profit)
+checkCorrVarAndTestHnull(hh_profit_model_r3)
+suppressWarnings(plotResiduals(hh_profit, hh_profit_model_r3, "orange", "R3"))
+```
+
+#### Restricted model with educ * age (R4)
+
+Although the education in the above model is not significant, we are curious to see if educ and age together would become significant. So we fit a model with `educ * age`. However, looking at the summary it's still not significant.
+
+```{r}
+hh_profit_model_r4 <- lm(profit ~ educ * age + female + ez + loc2 + market + transport, 
+                         data = hh_profit)
+checkCorrVarAndTestHnull(hh_profit_model_r4)
+suppressWarnings(plotResiduals(hh_profit, hh_profit_model_r4, "pink", "R4"))
+```
