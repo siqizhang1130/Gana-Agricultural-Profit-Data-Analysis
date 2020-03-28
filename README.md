@@ -1,4 +1,4 @@
-# Gana Agricultural Profit Data Analysis
+# Gana Agricultural Profit Analysis
 
 To find what determines agricultural profit in Ghana.
 
